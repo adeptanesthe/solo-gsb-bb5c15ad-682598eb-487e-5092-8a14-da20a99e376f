@@ -13,6 +13,9 @@ local working hours.
 - `/availability` builds working hours per **local date** (DST-correct),
   clips all busy instances to them, merges half-open intervals (adjacent
   included), and returns the complement shared by every calendar
+- `/conflicts` scans named calendars together and reports the UTC segments
+  where at least `minimum_concurrency` instances overlap, with the
+  participating instances for each segment
 - `/calendar-diff` compares two ICS versions over one UTC window by
   `UID + RECURRENCE-ID` and returns identity-sorted `added`/`removed`/
   `modified` instances (with `before`/`after`)
@@ -159,6 +162,150 @@ because the minimum length is inclusive:
     {"start": "2026-03-09T10:00:00Z", "end": "2026-03-09T11:00:00Z", "minutes": 60},
     {"start": "2026-03-09T12:00:00Z", "end": "2026-03-09T14:00:00Z", "minutes": 120},
     {"start": "2026-03-09T15:30:00Z", "end": "2026-03-09T16:00:00Z", "minutes": 30}
+  ]
+}
+```
+
+### `POST /conflicts`
+
+Finds the UTC segments where at least `minimum_concurrency` instances from
+the named calendars overlap. Each calendar is expanded with the same
+recurrence engine used by `/expand`; only instances that are **not**
+`STATUS:CANCELLED` and have a **positive duration** take part, and every
+participating interval is clipped to the half-open query window
+`[window_start, window_end)`. Request body:
+
+| Field                 | Type   | Description                                                    |
+| --------------------- | ------ | -------------------------------------------------------------- |
+| `calendars`           | object | Map of name → iCalendar text                                   |
+| `window_start`        | string | ISO 8601 timestamp, converted to UTC (naive = UTC)             |
+| `window_end`          | string | ISO 8601 timestamp, converted to UTC (naive = UTC)             |
+| `minimum_concurrency` | int    | Report segments with at least this many active instances (≥ 2) |
+
+A sweep line visits every interval start and end instant in chronological
+order. Intervals are half-open `[start, end)`, so at one and the same
+instant **ends are processed before starts**: a meeting ending at 11:00 and
+one starting at 11:00 are never concurrent. Each non-empty segment whose
+active count reaches the threshold is returned with its UTC `start`/`end`,
+its `count`, and the participating instances. Participants are sorted by
+`calendar`, then `UID`, then `RECURRENCE-ID` (a `null` `RECURRENCE-ID`
+sorts first). Two adjacent segments are merged only when their participant
+sets are exactly identical; the segments are sorted by `start`. Each
+participant is serialized like an `/expand` instance plus the `calendar`
+name; its `start`/`end` are the instance times clipped to the window.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "calendars": {
+      "alice": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:a1\r\nDTSTART:20260309T090000Z\r\nDTEND:20260309T110000Z\r\nSUMMARY:Deep work\r\nEND:VEVENT\r\nEND:VCALENDAR",
+      "bob": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:b1\r\nDTSTART:20260309T100000Z\r\nDTEND:20260309T120000Z\r\nSUMMARY:Interview\r\nEND:VEVENT\r\nEND:VCALENDAR",
+      "carol": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:c1\r\nDTSTART:20260309T103000Z\r\nDTEND:20260309T113000Z\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR"
+    },
+    "window_start": "2026-03-09T00:00:00Z",
+    "window_end": "2026-03-10T00:00:00Z",
+    "minimum_concurrency": 2
+  }'
+```
+
+Alice is busy 09:00–11:00, Bob 10:00–12:00 and Carol 10:30–11:30. The
+three-way overlap 10:30–11:00 is bracketed by two two-instance segments;
+all three are reported and stay separate because the participants differ:
+
+```json
+{
+  "window_start": "2026-03-09T00:00:00Z",
+  "window_end": "2026-03-10T00:00:00Z",
+  "minimum_concurrency": 2,
+  "count": 3,
+  "segments": [
+    {
+      "start": "2026-03-09T10:00:00Z",
+      "end": "2026-03-09T10:30:00Z",
+      "count": 2,
+      "participants": [
+        {
+          "calendar": "alice",
+          "uid": "a1",
+          "recurrence_id": null,
+          "summary": "Deep work",
+          "start": "2026-03-09T09:00:00Z",
+          "end": "2026-03-09T11:00:00Z",
+          "status": "CONFIRMED"
+        },
+        {
+          "calendar": "bob",
+          "uid": "b1",
+          "recurrence_id": null,
+          "summary": "Interview",
+          "start": "2026-03-09T10:00:00Z",
+          "end": "2026-03-09T12:00:00Z",
+          "status": "CONFIRMED"
+        }
+      ]
+    },
+    {
+      "start": "2026-03-09T10:30:00Z",
+      "end": "2026-03-09T11:00:00Z",
+      "count": 3,
+      "participants": [
+        {
+          "calendar": "alice",
+          "uid": "a1",
+          "recurrence_id": null,
+          "summary": "Deep work",
+          "start": "2026-03-09T09:00:00Z",
+          "end": "2026-03-09T11:00:00Z",
+          "status": "CONFIRMED"
+        },
+        {
+          "calendar": "bob",
+          "uid": "b1",
+          "recurrence_id": null,
+          "summary": "Interview",
+          "start": "2026-03-09T10:00:00Z",
+          "end": "2026-03-09T12:00:00Z",
+          "status": "CONFIRMED"
+        },
+        {
+          "calendar": "carol",
+          "uid": "c1",
+          "recurrence_id": null,
+          "summary": "Review",
+          "start": "2026-03-09T10:30:00Z",
+          "end": "2026-03-09T11:30:00Z",
+          "status": "CONFIRMED"
+        }
+      ]
+    },
+    {
+      "start": "2026-03-09T11:00:00Z",
+      "end": "2026-03-09T11:30:00Z",
+      "count": 2,
+      "participants": [
+        {
+          "calendar": "bob",
+          "uid": "b1",
+          "recurrence_id": null,
+          "summary": "Interview",
+          "start": "2026-03-09T10:00:00Z",
+          "end": "2026-03-09T12:00:00Z",
+          "status": "CONFIRMED"
+        },
+        {
+          "calendar": "carol",
+          "uid": "c1",
+          "recurrence_id": null,
+          "summary": "Review",
+          "start": "2026-03-09T10:30:00Z",
+          "end": "2026-03-09T11:30:00Z",
+          "status": "CONFIRMED"
+        }
+      ]
+    }
   ]
 }
 ```
@@ -365,6 +512,11 @@ expansions exceeding 10 000 occurrences per UID within the window.
 midnight, an offset-bearing working time, an unknown weekday key, and a
 non-positive `minimum_minutes`.
 
+`/conflicts` additionally returns `422` when `minimum_concurrency` is
+missing or less than 2, and reuses the calendar and window validation of
+the other endpoints (`window_start >= window_end`, unparsable ICS, invalid
+recurrence, unknown `TZID`).
+
 `/calendar-diff` reuses the same calendar and window validation, so it
 returns `422` when `window_start >= window_end` or when either `old_ics` or
 `new_ics` fails any of the `/expand` checks above.
@@ -440,6 +592,31 @@ checks.
 - Working periods crossing local midnight are not supported (a range must
   start and end on the same local date).
 
+### Conflict semantics
+
+- **Participants** are the expanded instances of every named calendar,
+  excluding `STATUS:CANCELLED` (master or override) and non-positive-duration
+  instances. Each participating interval is clipped to the query window
+  before the sweep, so an instance starting before `window_start` or ending
+  after `window_end` contributes only the in-window part; an instance merely
+  touching a boundary contributes nothing.
+- **Half-open sweep**: the line visits all start/end instants sorted by time;
+  at one instant every end is applied before every start, so back-to-back
+  intervals `[a, b)` and `[b, c)` share no instant and never count as
+  concurrent. The active set is constant between two consecutive instants.
+- **Segments** are the non-empty maximal intervals whose active count is at
+  least `minimum_concurrency` (which must be ≥ 2). Each segment carries its
+  `count`, equal to the number of `participants`.
+- **Merging** joins two qualifying segments only when they are adjacent
+  *and* their participating instances are exactly the same; segments with
+  the same participants separated by a gap (or by a below-threshold stretch)
+  remain distinct. The result is sorted by `start`.
+- **Participant order and shape**: participants are sorted by `calendar`,
+  then `UID`, then `RECURRENCE-ID` with `null` first; each carries the
+  `calendar` name plus the usual `/expand` fields (`uid`, `recurrence_id`,
+  `summary`, `start`, `end`, `status`), with `start`/`end` clipped to the
+  window.
+
 ## Development
 
 ```bash
@@ -452,11 +629,13 @@ uvicorn app.main:app --reload       # run locally on port 8000
 
 ```
 app/main.py          FastAPI app: POST /expand, POST /alarms,
-                     POST /calendar-diff, POST /availability, GET /health
+                     POST /calendar-diff, POST /availability,
+                     POST /conflicts, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
+app/conflicts.py     half-open sweep for minimum-concurrency segments
 tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup
