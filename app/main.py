@@ -16,6 +16,7 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
+from .conflicts import Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
 
@@ -23,7 +24,7 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.3.0",
+    version="1.4.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, and expand VALARM "
@@ -222,6 +223,19 @@ def _alarm_out(reminder: Reminder) -> AlarmOut:
     )
 
 
+def _conflict_participant_out(participant: Participant) -> ConflictParticipantOut:
+    instance = participant.instance
+    return ConflictParticipantOut(
+        calendar=participant.calendar,
+        uid=instance.uid,
+        recurrence_id=instance.recurrence_id,
+        summary=instance.summary,
+        start=instance.start,
+        end=instance.end,
+        status=instance.status,
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /calendar-diff
 # ---------------------------------------------------------------------------
@@ -251,6 +265,70 @@ class CalendarDiffResponse(BaseModel):
     added: list[InstanceOut]
     removed: list[InstanceOut]
     modified: list[ModifiedInstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /conflicts
+# ---------------------------------------------------------------------------
+
+
+class ConflictsRequest(BaseModel):
+    calendars: dict[str, str] = Field(
+        default_factory=dict,
+        description="Named iCalendar texts scanned together for concurrency. "
+        "May be empty.",
+    )
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+    minimum_concurrency: int = Field(
+        ...,
+        ge=2,
+        description="A segment is reported when at least this many instances "
+        "overlap; must be >= 2",
+    )
+
+
+class ConflictParticipantOut(BaseModel):
+    """One participating instance, prefixed with the calendar it came from."""
+
+    calendar: str
+    uid: str
+    recurrence_id: dt.datetime | None
+    summary: str | None
+    start: dt.datetime
+    end: dt.datetime
+    status: str
+
+    @field_serializer("recurrence_id", "start", "end")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _iso_z(value)
+
+
+class ConflictSegmentOut(BaseModel):
+    start: dt.datetime
+    end: dt.datetime
+    count: int
+    participants: list[ConflictParticipantOut]
+
+    @field_serializer("start", "end")
+    def _serialize_dt(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+class ConflictsResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    minimum_concurrency: int
+    count: int
+    segments: list[ConflictSegmentOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -370,5 +448,41 @@ def availability(request: AvailabilityRequest) -> AvailabilityResponse:
                 minutes=int((end - start).total_seconds() // 60),
             )
             for start, end in slots
+        ],
+    )
+
+
+@app.post("/conflicts", response_model=ConflictsResponse)
+def conflicts(request: ConflictsRequest) -> ConflictsResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        segments = find_conflicts(
+            request.calendars,
+            window_start,
+            window_end,
+            request.minimum_concurrency,
+        )
+    except ExpansionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ConflictsResponse(
+        window_start=window_start,
+        window_end=window_end,
+        minimum_concurrency=request.minimum_concurrency,
+        count=len(segments),
+        segments=[
+            ConflictSegmentOut(
+                start=segment.start,
+                end=segment.end,
+                count=segment.count,
+                participants=[
+                    _conflict_participant_out(p) for p in segment.participants
+                ],
+            )
+            for segment in segments
         ],
     )

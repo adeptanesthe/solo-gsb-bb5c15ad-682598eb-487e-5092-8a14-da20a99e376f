@@ -16,6 +16,9 @@ local working hours.
 - `/calendar-diff` compares two ICS versions over one UTC window by
   `UID + RECURRENCE-ID` and returns identity-sorted `added`/`removed`/
   `modified` instances (with `before`/`after`)
+- `/conflicts` sweeps the instances of named calendars over one UTC window
+  and reports every time range where the concurrency reaches a threshold
+  (≥ 2), with the sorted participating instances
 - `/alarms` expands `VALARM` reminders for every instance in a window:
   a master event's alarms apply to each recurring instance, overrides
   carry their own, and `REPEAT`/`DURATION` fan alarms out
@@ -259,6 +262,152 @@ unchanged March 2/16/23 standups are not reported:
 }
 ```
 
+### `POST /conflicts`
+
+Finds time ranges where instances of **several named calendars** overlap at
+the same time — i.e. where the event concurrency reaches a requested
+threshold. Request body:
+
+| Field                 | Type   | Description                                                    |
+| --------------------- | ------ | -------------------------------------------------------------- |
+| `calendars`           | object | Map of name → iCalendar text; may be empty or omitted          |
+| `window_start`        | string | ISO 8601 timestamp, converted to UTC (naive = UTC)             |
+| `window_end`          | string | ISO 8601 timestamp, converted to UTC (naive = UTC)             |
+| `minimum_concurrency` | int    | Report segments with at least this many overlaps (must be ≥ 2) |
+
+Every calendar is expanded with the same recurrence engine used by
+`/expand`. Only instances that are not `STATUS:CANCELLED` and have a
+strictly positive duration participate; each interval is clipped to the
+half-open query window `[window_start, window_end)`.
+
+A sweep line visits all interval starts and ends: at any boundary instant
+**ends are applied before starts**, so back-to-back events (one ending
+exactly when another begins) never conflict. Every non-empty portion of the
+timeline on which the active instance count is at least
+`minimum_concurrency` becomes a segment. Each segment carries UTC `start`,
+UTC `end`, `count`, and a `participants` list — the instances active on
+that range, sorted by `calendar`, then `UID`, then `RECURRENCE-ID` (a
+`null` `RECURRENCE-ID` sorts first). Every participant has the same shape
+as an `/expand` instance plus the owning `calendar` name.
+
+Adjacent segments are merged into one only when their participants are
+exactly the same identities in the same order; a gap or any participant
+change keeps them separate. The response `segments` are sorted by `start`.
+`window_start`, `window_end` and `minimum_concurrency` are echoed back.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "calendars": {
+      "alice": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:planning\r\nDTSTART:20260316T090000Z\r\nDTEND:20260316T110000Z\r\nSUMMARY:Sprint planning\r\nEND:VEVENT\r\nEND:VCALENDAR",
+      "bob": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260316T093000Z\r\nDTEND:20260316T100000Z\r\nSUMMARY:Daily standup\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:deep-work\r\nDTSTART:20260316T100000Z\r\nDTEND:20260316T120000Z\r\nSUMMARY:Deep work\r\nEND:VEVENT\r\nEND:VCALENDAR",
+      "carol": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:review\r\nDTSTART:20260316T094500Z\r\nDTEND:20260316T103000Z\r\nSUMMARY:Design review\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:cancelled-slot\r\nDTSTART:20260316T100000Z\r\nDTEND:20260316T110000Z\r\nSTATUS:CANCELLED\r\nSUMMARY:Cancelled invite\r\nEND:VEVENT\r\nEND:VCALENDAR"
+    },
+    "window_start": "2026-03-16T00:00:00Z",
+    "window_end": "2026-03-17T00:00:00Z",
+    "minimum_concurrency": 2
+  }'
+```
+
+Alice's planning runs 09:00–11:00, Bob has standup 09:30–10:00 and deep
+work 10:00–12:00, and Carol has a design review 09:45–10:30 (her other
+invite is `CANCELLED` and ignored). The timeline yields four segments;
+note that Bob's back-to-back events split at 10:00 — ends are processed
+before starts, and the adjacent segments are *not* merged because their
+participant sets differ:
+
+```json
+{
+  "window_start": "2026-03-16T00:00:00Z",
+  "window_end": "2026-03-17T00:00:00Z",
+  "minimum_concurrency": 2,
+  "count": 4,
+  "segments": [
+    {
+      "start": "2026-03-16T09:30:00Z",
+      "end": "2026-03-16T09:45:00Z",
+      "count": 2,
+      "participants": [
+        {
+          "calendar": "alice",
+          "uid": "planning",
+          "recurrence_id": null,
+          "summary": "Sprint planning",
+          "start": "2026-03-16T09:00:00Z",
+          "end": "2026-03-16T11:00:00Z",
+          "status": "CONFIRMED"
+        },
+        {
+          "calendar": "bob",
+          "uid": "standup",
+          "recurrence_id": null,
+          "summary": "Daily standup",
+          "start": "2026-03-16T09:30:00Z",
+          "end": "2026-03-16T10:00:00Z",
+          "status": "CONFIRMED"
+        }
+      ]
+    },
+    {
+      "start": "2026-03-16T09:45:00Z",
+      "end": "2026-03-16T10:00:00Z",
+      "count": 3,
+      "participants": [
+        {"calendar": "alice", "uid": "planning", "recurrence_id": null,
+         "summary": "Sprint planning",
+         "start": "2026-03-16T09:00:00Z", "end": "2026-03-16T11:00:00Z",
+         "status": "CONFIRMED"},
+        {"calendar": "bob", "uid": "standup", "recurrence_id": null,
+         "summary": "Daily standup",
+         "start": "2026-03-16T09:30:00Z", "end": "2026-03-16T10:00:00Z",
+         "status": "CONFIRMED"},
+        {"calendar": "carol", "uid": "review", "recurrence_id": null,
+         "summary": "Design review",
+         "start": "2026-03-16T09:45:00Z", "end": "2026-03-16T10:30:00Z",
+         "status": "CONFIRMED"}
+      ]
+    },
+    {
+      "start": "2026-03-16T10:00:00Z",
+      "end": "2026-03-16T10:30:00Z",
+      "count": 3,
+      "participants": [
+        {"calendar": "alice", "uid": "planning", "recurrence_id": null,
+         "summary": "Sprint planning",
+         "start": "2026-03-16T09:00:00Z", "end": "2026-03-16T11:00:00Z",
+         "status": "CONFIRMED"},
+        {"calendar": "bob", "uid": "deep-work", "recurrence_id": null,
+         "summary": "Deep work",
+         "start": "2026-03-16T10:00:00Z", "end": "2026-03-16T12:00:00Z",
+         "status": "CONFIRMED"},
+        {"calendar": "carol", "uid": "review", "recurrence_id": null,
+         "summary": "Design review",
+         "start": "2026-03-16T09:45:00Z", "end": "2026-03-16T10:30:00Z",
+         "status": "CONFIRMED"}
+      ]
+    },
+    {
+      "start": "2026-03-16T10:30:00Z",
+      "end": "2026-03-16T11:00:00Z",
+      "count": 2,
+      "participants": [
+        {"calendar": "alice", "uid": "planning", "recurrence_id": null,
+         "summary": "Sprint planning",
+         "start": "2026-03-16T09:00:00Z", "end": "2026-03-16T11:00:00Z",
+         "status": "CONFIRMED"},
+        {"calendar": "bob", "uid": "deep-work", "recurrence_id": null,
+         "summary": "Deep work",
+         "start": "2026-03-16T10:00:00Z", "end": "2026-03-16T12:00:00Z",
+         "status": "CONFIRMED"}
+      ]
+    }
+  ]
+}
+```
+
 ### `POST /alarms`
 
 Expands the `VALARM` reminders of every `VEVENT` instance that overlaps the
@@ -369,6 +518,10 @@ non-positive `minimum_minutes`.
 returns `422` when `window_start >= window_end` or when either `old_ics` or
 `new_ics` fails any of the `/expand` checks above.
 
+`/conflicts` additionally returns `422` for a `minimum_concurrency` below
+2 (it must be present and be at least 2); an invalid window or any
+calendar failing the `/expand` checks above yields `422` as well.
+
 `/alarms` additionally returns `422` for: an `ACTION` other than
 `DISPLAY` (or a missing `ACTION`), a `DISPLAY` alarm without
 `DESCRIPTION`, a missing or unsupported `TRIGGER` (only `DURATION` and
@@ -440,6 +593,30 @@ checks.
 - Working periods crossing local midnight are not supported (a range must
   start and end on the same local date).
 
+### Conflict semantics
+
+- **Participation**: every named calendar is expanded with the shared
+  recurrence engine; `STATUS:CANCELLED` instances (including cancelled
+  recurrence overrides) and zero/negative-duration instances never
+  participate. Each remaining interval is clipped to the half-open window
+  `[window_start, window_end)` before the sweep.
+- **Half-open sweep**: intervals are `[start, end)`. At a boundary instant
+  all ends are applied before any start, so events that merely touch do
+  not overlap, and an event ending exactly at `window_start` takes no
+  part. Only non-empty subranges are emitted.
+- **Segments** are the maximal consecutive portions of the window where
+  the active count is at least `minimum_concurrency` (≥ 2). Two adjacent
+  segments are joined only when they carry the exact same participant
+  identities; a gap or any joining/leaving participant keeps them
+  separate. Segments are sorted by `start`.
+- **Participants** are sorted by `calendar`, then `UID`, then
+  `RECURRENCE-ID` (a `null` `RECURRENCE-ID` sorts first), and each carries
+  the owning `calendar` plus the full `/expand` instance fields
+  (`uid`, `recurrence_id`, `summary`, `start`, `end`, `status`) with UTC
+  `Z` timestamps.
+- The same `UID + RECURRENCE-ID` occurring under two different calendar
+  names counts as two distinct participants.
+
 ## Development
 
 ```bash
@@ -452,11 +629,13 @@ uvicorn app.main:app --reload       # run locally on port 8000
 
 ```
 app/main.py          FastAPI app: POST /expand, POST /alarms,
-                     POST /calendar-diff, POST /availability, GET /health
+                     POST /calendar-diff, POST /availability,
+                     POST /conflicts, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
+app/conflicts.py     multi-calendar sweep-line concurrency/conflict segments
 tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup
